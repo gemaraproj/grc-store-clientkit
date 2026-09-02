@@ -163,6 +163,20 @@ type tokenResponse struct {
 	ErrorDescription string `json:"error_description,omitempty"`
 }
 
+// bodyForError renders a token-endpoint body for inclusion in an error message.
+// A 200 body IS a token response, so echoing it verbatim puts access_token and
+// refresh_token into terminal output and CI logs — a malformed-but-token-bearing
+// 200 (a gateway sending expires_in as a string, a truncated proxy response) is
+// exactly the case that reaches these messages. Non-200 bodies carry the
+// protocol error and no credential, so they stay verbatim: that is the half of
+// the debuggability worth keeping.
+func bodyForError(status int, body []byte) string {
+	if status == http.StatusOK {
+		return "<redacted: a 200 token-endpoint body may contain credentials>"
+	}
+	return strings.TrimSpace(string(body))
+}
+
 // PollForToken blocks polling the token endpoint until the device flow
 // terminates, returning the issued Credentials. It honors slow_down (RFC 8628
 // §3.5) by widening the interval, and bounds the whole loop by the device
@@ -206,12 +220,12 @@ func PollForToken(ctx context.Context, meta *OIDCMetadata, clientID string, da *
 		}
 		tr := tokenResponse{}
 		if err := json.Unmarshal(body, &tr); err != nil {
-			return nil, fmt.Errorf("decoding token response (HTTP %d): %w (body: %s)", resp.StatusCode, err, strings.TrimSpace(string(body)))
+			return nil, fmt.Errorf("decoding token response (HTTP %d): %w (body: %s)", resp.StatusCode, err, bodyForError(resp.StatusCode, body))
 		}
 		switch tr.Error {
 		case "":
 			if tr.AccessToken == "" {
-				return nil, fmt.Errorf("token endpoint returned no access_token and no error: %s", strings.TrimSpace(string(body)))
+				return nil, fmt.Errorf("token endpoint returned no access_token and no error: %s", bodyForError(resp.StatusCode, body))
 			}
 			return credsFromTokenResponse(meta.Issuer, &tr), nil
 		case "authorization_pending":
@@ -255,7 +269,7 @@ func RefreshToken(ctx context.Context, meta *OIDCMetadata, clientID, refreshToke
 	}
 	tr := tokenResponse{}
 	if err := json.Unmarshal(body, &tr); err != nil {
-		return nil, fmt.Errorf("decoding refresh response (HTTP %d): %w (body: %s)", resp.StatusCode, err, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("decoding refresh response (HTTP %d): %w (body: %s)", resp.StatusCode, err, bodyForError(resp.StatusCode, body))
 	}
 	if tr.Error != "" {
 		if tr.ErrorDescription != "" {

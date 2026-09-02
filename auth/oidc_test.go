@@ -287,3 +287,52 @@ func TestRefreshToken_HappyPath(t *testing.T) {
 		t.Errorf("creds = %+v", creds)
 	}
 }
+
+// A 200 that fails to decode must not echo the body: it is a token response, so
+// the body holds the credential the caller was trying to obtain. The 400 case
+// keeps its body, which is where the protocol error lives.
+func TestTokenBodyIsRedactedOnlyWhenItCouldHoldACredential(t *testing.T) {
+	// expires_in as a JSON string fails json.Unmarshal into an int field, which
+	// is how a well-formed-looking 200 reaches the decode-error path at all.
+	const leaky = `{"access_token":"super-secret","refresh_token":"also-secret","expires_in":"3600"}`
+
+	t.Run("200 body redacted", func(t *testing.T) {
+		srv := tokenEndpoint(t, http.StatusOK, leaky)
+		defer srv.Close()
+		meta := &OIDCMetadata{Issuer: srv.URL, TokenEndpoint: srv.URL + "/token"}
+
+		_, err := RefreshToken(context.Background(), meta, "cid", "rt")
+		if err == nil {
+			t.Fatal("expected a decode error")
+		}
+		if strings.Contains(err.Error(), "super-secret") || strings.Contains(err.Error(), "also-secret") {
+			t.Errorf("error leaked credential material: %v", err)
+		}
+		if !strings.Contains(err.Error(), "redacted") {
+			t.Errorf("error should say the body was redacted, got: %v", err)
+		}
+	})
+
+	t.Run("400 body preserved", func(t *testing.T) {
+		srv := tokenEndpoint(t, http.StatusBadRequest, `{"error":]`)
+		defer srv.Close()
+		meta := &OIDCMetadata{Issuer: srv.URL, TokenEndpoint: srv.URL + "/token"}
+
+		_, err := RefreshToken(context.Background(), meta, "cid", "rt")
+		if err == nil {
+			t.Fatal("expected a decode error")
+		}
+		if !strings.Contains(err.Error(), `{"error":]`) {
+			t.Errorf("a 400 body carries the protocol error and should be shown, got: %v", err)
+		}
+	})
+}
+
+func tokenEndpoint(t *testing.T, status int, body string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = fmt.Fprint(w, body)
+	}))
+}
