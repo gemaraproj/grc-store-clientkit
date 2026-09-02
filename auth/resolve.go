@@ -42,6 +42,13 @@ type ResolveInput struct {
 	// Now returns the current time. Nil uses time.Now; tests pin it so the
 	// renewal-window branch is deterministic.
 	Now func() time.Time
+	// StoreErr explains why Store is nil, for a caller that tried to open one and
+	// failed. Resolve cannot tell "this tool keeps no store" from "this tool's
+	// store could not be located", and the two have different fixes: the first
+	// wants a login, the second wants $HOME or $XDG_DATA_HOME made resolvable.
+	// Leave nil when Store is nil by design.
+	StoreErr error
+
 	// Warn receives a one-line message when Resolve hits something non-fatal
 	// worth saying out loud (a refreshed token that could not be persisted).
 	// Nil discards; os.Stderr is the usual sink.
@@ -57,9 +64,16 @@ type ErrNoToken struct {
 	// not consulted at all.
 	Issuer string
 	// CheckedStore distinguishes "looked in the store and found nothing" from
-	// "had no issuer, so never looked" — different user-facing fixes.
+	// "never looked" — different user-facing fixes.
 	CheckedStore bool
+	// StoreErr is why the store could not be consulted, when the caller supplied
+	// a reason. Nil means the store was skipped for want of an issuer rather
+	// than because locating it failed.
+	StoreErr error
 }
+
+// Unwrap exposes the store-location failure so a caller can match on it.
+func (e *ErrNoToken) Unwrap() error { return e.StoreErr }
 
 func (e *ErrNoToken) Error() string {
 	// Only name the sources this App actually has: a flag it never registered
@@ -77,11 +91,19 @@ func (e *ErrNoToken) Error() string {
 		tried = append(tried, "no stored credentials for "+e.Issuer)
 		return fmt.Sprintf("no token available: %s — %s to sign in", strings.Join(tried, ", "), e.App.LoginHint())
 	}
-	// Resolve only knows the issuer is missing, not why: the command may have
-	// run without a hub URL, or the hub may advertise no oidc_issuer. Name the
-	// fact, not a guessed cause.
-	tried = append(tried, "no OIDC issuer is known so the credential store cannot be consulted")
-	fixes := []string{"use a hub that advertises oidc_issuer"}
+	// The store was not consulted. Say which of the two reasons applies: naming
+	// the wrong one sends the user at a fix that cannot work — telling someone
+	// whose $HOME is unset to find a hub advertising oidc_issuer, say.
+	var fixes []string
+	if e.StoreErr != nil {
+		tried = append(tried, fmt.Sprintf("the credential store could not be located (%v)", e.StoreErr))
+	} else {
+		// Resolve knows only that the issuer is missing, not why: the command may
+		// have run without a hub URL, or the hub may advertise no oidc_issuer.
+		// Name the fact, not a guessed cause.
+		tried = append(tried, "no OIDC issuer is known so the credential store cannot be consulted")
+		fixes = append(fixes, "use a hub that advertises oidc_issuer")
+	}
 	if e.App.TokenEnv != "" {
 		fixes = append(fixes, "set "+e.App.TokenEnv)
 	}
@@ -120,7 +142,11 @@ func Resolve(ctx context.Context, in ResolveInput) (string, error) {
 		}
 	}
 	if in.Store == nil || in.Issuer == "" {
-		return "", &ErrNoToken{App: in.App, CheckedStore: false}
+		e := &ErrNoToken{App: in.App, Issuer: in.Issuer}
+		if in.Store == nil {
+			e.StoreErr = in.StoreErr
+		}
+		return "", e
 	}
 
 	creds, err := in.Store.Get(in.Issuer)

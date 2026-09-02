@@ -248,3 +248,48 @@ func TestResolve_HintsNameTheCallingTool(t *testing.T) {
 		t.Errorf("error should name the flag grcli registers, got: %v", err)
 	}
 }
+
+// A store that could not be located must not be reported as a missing issuer:
+// the two have different fixes, and an issuer was supplied here.
+func TestResolve_StoreErrIsNotReportedAsAMissingIssuer(t *testing.T) {
+	app := App{Name: "pvtr", TokenEnv: "PVTR_TOKEN"}
+	t.Setenv(app.TokenEnv, "")
+	boom := errors.New("resolving home dir for credential store: $HOME is not defined")
+
+	_, err := Resolve(context.Background(), ResolveInput{
+		App:      app,
+		Issuer:   "https://issuer",
+		StoreErr: boom,
+	})
+
+	var noTok *ErrNoToken
+	if !errors.As(err, &noTok) {
+		t.Fatalf("expected *ErrNoToken, got %v", err)
+	}
+	if !errors.Is(err, boom) {
+		t.Error("the store failure should stay matchable through Unwrap")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "the credential store could not be located") {
+		t.Errorf("message should name the store failure, got: %v", msg)
+	}
+	if strings.Contains(msg, "no OIDC issuer") || strings.Contains(msg, "advertises oidc_issuer") {
+		t.Errorf("an issuer WAS supplied; message must not blame a missing one, got: %v", msg)
+	}
+}
+
+// With no issuer and no store failure, the issuer is still the thing to name.
+func TestResolve_MissingIssuerStillNamesTheIssuer(t *testing.T) {
+	app := App{Name: "pvtr", TokenEnv: "PVTR_TOKEN"}
+	t.Setenv(app.TokenEnv, "")
+
+	_, err := Resolve(context.Background(), ResolveInput{App: app, Store: &Store{App: app, Path: "/nonexistent/credentials.json"}})
+
+	msg := err.Error()
+	if !strings.Contains(msg, "no OIDC issuer") || !strings.Contains(msg, "advertises oidc_issuer") {
+		t.Errorf("message should blame the missing issuer, got: %v", msg)
+	}
+	if strings.Contains(msg, "could not be located") {
+		t.Errorf("the store was fine; message must not claim otherwise, got: %v", msg)
+	}
+}
