@@ -71,6 +71,19 @@ func TestResolve_Order(t *testing.T) {
 		if !strings.Contains(err.Error(), "credential store cannot be consulted") {
 			t.Errorf("error should explain why the store was skipped, got: %v", err)
 		}
+		// Resolve cannot tell a missing hub URL from a hub with no oidc_issuer,
+		// so it must not diagnose one.
+		if strings.Contains(err.Error(), "hub URL") {
+			t.Errorf("error asserts a cause Resolve cannot know, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "set "+app.TokenEnv) {
+			t.Errorf("error should suggest the env var the tool actually has, got: %v", err)
+		}
+		// A tool with no TokenEnv must not be told to set one.
+		_, err = Resolve(ctx, ResolveInput{App: App{Name: "grcli"}})
+		if err == nil || strings.Contains(err.Error(), "set ") {
+			t.Errorf("error suggests an env var the tool did not configure, got: %v", err)
+		}
 	})
 
 	t.Run("no token with an issuer reports the store-checked shape", func(t *testing.T) {
@@ -223,5 +236,15 @@ func TestResolve_HintsNameTheCallingTool(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "grcli") {
 		t.Errorf("error mentions grcli to a pvtr user: %v", err)
+	}
+	// pvtr registers no --token flag, so the error must not offer one.
+	if strings.Contains(err.Error(), "--token") {
+		t.Errorf("error offers a --token flag pvtr does not have: %v", err)
+	}
+
+	grcli := App{Name: "grcli", TokenEnv: "GRCLI_TOKEN", TokenFlag: "--token"}
+	_, err = Resolve(context.Background(), ResolveInput{App: grcli, Issuer: testIssuer, Store: tempStore(t)})
+	if err == nil || !strings.Contains(err.Error(), "--token unset") {
+		t.Errorf("error should name the flag grcli registers, got: %v", err)
 	}
 }

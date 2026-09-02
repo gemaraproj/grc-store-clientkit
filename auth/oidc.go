@@ -246,6 +246,13 @@ func RefreshToken(ctx context.Context, meta *OIDCMetadata, clientID, refreshToke
 	if err != nil {
 		return nil, fmt.Errorf("refresh request: %w", err)
 	}
+	// Same hazard as PollForToken: 200 carries a token, 400 carries the
+	// protocol error (invalid_grant for a revoked or rotated refresh token).
+	// Anything else is the server malfunctioning, and its body is not a token
+	// response.
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusBadRequest {
+		return nil, fmt.Errorf("token endpoint returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 	tr := tokenResponse{}
 	if err := json.Unmarshal(body, &tr); err != nil {
 		return nil, fmt.Errorf("decoding refresh response (HTTP %d): %w (body: %s)", resp.StatusCode, err, strings.TrimSpace(string(body)))

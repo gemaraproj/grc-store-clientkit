@@ -26,7 +26,7 @@ does it, or if it is user-facing presentation — the CLIs own their own output.
 
 - **`auth`** — OIDC device-authorization grant (RFC 8628), the on-disk credential store, token
   resolution with refresh, and the GitHub Actions workload-OIDC fetch. Parameterized by an `App`
-  (`{Name, TokenEnv}`) so each tool keeps its own credential file and its own name in error messages.
+  (`{Name, TokenEnv, TokenFlag}`) so each tool keeps its own credential file and its own name in error messages.
 - **`trustroot`** — the pinned public-good Sigstore trusted root, as bytes. Previously three
   byte-identical copies across grcli, privateer-sdk, and the hub backend; now one rotation obligation.
 

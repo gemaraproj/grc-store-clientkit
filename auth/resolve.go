@@ -18,13 +18,13 @@ type ResolveInput struct {
 	// App names the tool: it supplies the environment variable consulted for an
 	// explicit token, and the tool name in every error. Required.
 	App App
-	// ExplicitToken is a token supplied directly by the user, typically a
-	// --token flag. It wins over everything.
+	// ExplicitToken is a token supplied directly by the user, typically the
+	// flag named by App.TokenFlag. It wins over everything.
 	ExplicitToken string
 	// Issuer is the OIDC issuer URL naming which stored credentials to look up,
 	// typically the oidc_issuer from hub discovery. Empty means "do not consult
-	// the store" — the case where the command ran without a hub URL, so no
-	// discovery happened and there is no issuer to key on.
+	// the store" — typically because the command ran without a hub URL so no
+	// discovery happened, or because the hub advertised no oidc_issuer.
 	Issuer string
 	// ClientID drives a refresh when the stored token is inside the renewal
 	// window, typically the oidc_cli_client_id from hub discovery. Empty when a
@@ -62,16 +62,31 @@ type ErrNoToken struct {
 }
 
 func (e *ErrNoToken) Error() string {
-	envPart := "no token env var is configured"
+	// Only name the sources this App actually has: a flag it never registered
+	// is a fix the user cannot apply.
+	var tried []string
+	if e.App.TokenFlag != "" {
+		tried = append(tried, e.App.TokenFlag+" unset")
+	}
 	if e.App.TokenEnv != "" {
-		envPart = e.App.TokenEnv + " unset"
+		tried = append(tried, e.App.TokenEnv+" unset")
+	} else {
+		tried = append(tried, "no token env var is configured")
 	}
 	if e.CheckedStore {
-		return fmt.Sprintf("no token available: --token unset, %s, and no stored credentials for %s — %s to sign in",
-			envPart, e.Issuer, e.App.LoginHint())
+		tried = append(tried, "no stored credentials for "+e.Issuer)
+		return fmt.Sprintf("no token available: %s — %s to sign in", strings.Join(tried, ", "), e.App.LoginHint())
 	}
-	return fmt.Sprintf("no token available: --token unset, %s, and no hub URL was given so the credential store cannot be consulted — pass a hub URL, set the token env var, or %s",
-		envPart, e.App.LoginHint())
+	// Resolve only knows the issuer is missing, not why: the command may have
+	// run without a hub URL, or the hub may advertise no oidc_issuer. Name the
+	// fact, not a guessed cause.
+	tried = append(tried, "no OIDC issuer is known so the credential store cannot be consulted")
+	fixes := []string{"use a hub that advertises oidc_issuer"}
+	if e.App.TokenEnv != "" {
+		fixes = append(fixes, "set "+e.App.TokenEnv)
+	}
+	fixes = append(fixes, e.App.LoginHint())
+	return fmt.Sprintf("no token available: %s — %s", strings.Join(tried, ", "), strings.Join(fixes, ", or "))
 }
 
 // Resolve returns a bearer token authenticating writes to the hub and registry.

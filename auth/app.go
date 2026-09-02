@@ -33,6 +33,13 @@ type App struct {
 	// environment path entirely, so a tool that does not want one cannot get it
 	// by accident.
 	TokenEnv string
+	// TokenFlag is the flag the tool registers for an explicit bearer token, as
+	// the user types it ("--token"). It is only ever used in error text: a
+	// no-token error lists it among the sources that came up empty. Empty means
+	// the tool has no such flag, and the error must not name one — a message
+	// offering --token to a tool that never registered it points the user at a
+	// fix that does not exist.
+	TokenFlag string
 }
 
 // name is the tool name to print, with a fallback so a zero App still produces

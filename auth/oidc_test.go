@@ -4,6 +4,7 @@ package auth
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -241,5 +242,48 @@ func TestFreshTokenIsNotBornExpired(t *testing.T) {
 		if creds.ExpiredAt(time.Now()) {
 			t.Errorf("token with expires_in=%d is born expired (ExpiresAt %s)", expiresIn, creds.ExpiresAt)
 		}
+	}
+}
+
+// RefreshToken shares PollForToken's hazard: a malfunctioning server's body
+// must not be decoded as a token response. Its pre-extraction copy in
+// privateer-sdk had this check; the merge dropped it.
+func TestRefreshToken_UnexpectedStatusIsNotAProtocolState(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		fmt.Fprint(w, "<html>upstream is down</html>")
+	}))
+	defer srv.Close()
+
+	_, err := RefreshToken(context.Background(), &OIDCMetadata{TokenEndpoint: srv.URL}, "test-client", "refresh-1")
+	if err == nil {
+		t.Fatal("RefreshToken = nil error on a 502, want a failure")
+	}
+	if !strings.Contains(err.Error(), "502") {
+		t.Errorf("error should surface the status, got: %v", err)
+	}
+}
+
+func TestRefreshToken_HappyPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			t.Fatal(err)
+		}
+		if got := r.Form.Get("grant_type"); got != "refresh_token" {
+			t.Errorf("grant_type = %q, want refresh_token", got)
+		}
+		if got := r.Form.Get("refresh_token"); got != "refresh-1" {
+			t.Errorf("refresh_token = %q, want refresh-1", got)
+		}
+		_ = json.NewEncoder(w).Encode(tokenResponse{AccessToken: "fresh", RefreshToken: "refresh-2", ExpiresIn: 300})
+	}))
+	defer srv.Close()
+
+	creds, err := RefreshToken(context.Background(), &OIDCMetadata{Issuer: "https://auth.example/realms/t", TokenEndpoint: srv.URL}, "test-client", "refresh-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if creds.AccessToken != "fresh" || creds.RefreshToken != "refresh-2" || creds.Issuer != "https://auth.example/realms/t" {
+		t.Errorf("creds = %+v", creds)
 	}
 }
