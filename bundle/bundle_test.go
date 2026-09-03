@@ -30,6 +30,33 @@ var testInput = Input{
 	Provenance: map[string]string{"buildType": "test"},
 }
 
+func TestCredentialFunc_BindsToHost(t *testing.T) {
+	t.Setenv("DOCKER_CONFIG", t.TempDir()) // no ambient docker login
+	t.Setenv(RegistryTokenEnv, "")
+	t.Setenv(RegistryUsernameEnv, "")
+	t.Setenv(RegistryPasswordEnv, "")
+	creds, err := credentialFunc("registry.test", "minted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if c, _ := creds(ctx, "registry.test"); c.AccessToken != "minted" {
+		t.Errorf("registry host: got %+v, want the minted token", c)
+	}
+	if c, _ := creds(ctx, "blobs.elsewhere.test"); c.AccessToken != "" || c.Username != "" {
+		t.Errorf("other host must never see the registry token, got %+v", c)
+	}
+	t.Setenv(RegistryUsernameEnv, "u")
+	t.Setenv(RegistryPasswordEnv, "p")
+	creds, _ = credentialFunc("registry.test", "")
+	if c, _ := creds(ctx, "registry.test"); c.Username != "u" || c.Password != "p" {
+		t.Errorf("env pair: got %+v", c)
+	}
+	if c, _ := creds(ctx, "blobs.elsewhere.test"); c.Username != "" {
+		t.Errorf("env pair leaked to another host: %+v", c)
+	}
+}
+
 func TestPushLocal_RoundTripsThroughUnpack(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

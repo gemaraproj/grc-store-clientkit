@@ -92,7 +92,7 @@ var openRepository = func(r Registry, repository string) (oras.Target, error) {
 		return nil, fmt.Errorf("constructing repository client: %w", err)
 	}
 	repo.PlainHTTP = r.PlainHTTP
-	creds, err := credentialFunc(r.Token)
+	creds, err := credentialFunc(r.Host, r.Token)
 	if err != nil {
 		return nil, err
 	}
@@ -111,20 +111,25 @@ var openRepository = func(r Registry, repository string) (oras.Target, error) {
 // credentialFunc resolves, in order: the explicit token, the env
 // username/password pair, the env token, then ~/.docker/config.json and
 // its helpers (what `docker login` writes, so CI runners get auth for free).
-func credentialFunc(token string) (auth.CredentialFunc, error) {
+// The first three are bound to host: a redirect to any other host (a blob
+// store behind the registry, say) gets only the Docker chain, never the
+// registry token.
+func credentialFunc(host, token string) (auth.CredentialFunc, error) {
 	store, err := credentials.NewStoreFromDocker(credentials.StoreOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("loading docker credentials: %w", err)
 	}
 	return func(ctx context.Context, registry string) (auth.Credential, error) {
-		if token != "" {
-			return auth.Credential{AccessToken: token}, nil
-		}
-		if u, p := os.Getenv(RegistryUsernameEnv), os.Getenv(RegistryPasswordEnv); u != "" && p != "" {
-			return auth.Credential{Username: u, Password: p}, nil
-		}
-		if t := os.Getenv(RegistryTokenEnv); t != "" {
-			return auth.Credential{AccessToken: t}, nil
+		if registry == host {
+			if token != "" {
+				return auth.Credential{AccessToken: token}, nil
+			}
+			if u, p := os.Getenv(RegistryUsernameEnv), os.Getenv(RegistryPasswordEnv); u != "" && p != "" {
+				return auth.Credential{Username: u, Password: p}, nil
+			}
+			if t := os.Getenv(RegistryTokenEnv); t != "" {
+				return auth.Credential{AccessToken: t}, nil
+			}
 		}
 		return credentials.Credential(store)(ctx, registry)
 	}, nil
