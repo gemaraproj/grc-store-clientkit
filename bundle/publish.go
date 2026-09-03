@@ -84,26 +84,9 @@ func Publish(ctx context.Context, in Input, t Target, signer *keyless.Signer) (*
 		return nil, err
 	}
 	out := &Published{Result: *res}
-
-	if signer != nil {
-		sig, err := signer.Sign(ctx, res.ManifestDigest, "", nil)
-		if err != nil {
-			return nil, fmt.Errorf("signing %s: %w", res.Reference, err)
-		}
-		if err := reg.Attach(ctx, t.Repository, res.Manifest, mediatype.SigstoreBundle, sig); err != nil {
-			return nil, err
-		}
-		out.Signed = true
-		if in.Provenance != nil {
-			att, err := signer.Sign(ctx, res.ManifestDigest, provenance.PredicateType, in.Provenance)
-			if err != nil {
-				return nil, fmt.Errorf("signing provenance for %s: %w", res.Reference, err)
-			}
-			if err := reg.Attach(ctx, t.Repository, res.Manifest, ProvenanceArtifactType, att); err != nil {
-				return nil, err
-			}
-			out.Attested = true
-		}
+	out.Signed, out.Attested, err = reg.SignAndAttach(ctx, t.Repository, res, signer, in.Provenance)
+	if err != nil {
+		return nil, err
 	}
 
 	out.Sync, err = client.SyncBundle(ctx, t.Repository, t.Tag)
@@ -111,6 +94,35 @@ func Publish(ctx context.Context, in Input, t Target, signer *keyless.Signer) (*
 		return nil, err
 	}
 	return out, nil
+}
+
+// SignAndAttach is steps 4 and 5 of Publish, exported for a caller that
+// runs its own push and sync around them (grcli's cosign-key mode shares
+// nothing here, its keyless mode shares exactly this). A nil signer is a
+// no-op. predicate, when non-nil, is signed as a second referrer stamped
+// ProvenanceArtifactType. Both statements bind res.ManifestDigest.
+func (r Registry) SignAndAttach(ctx context.Context, repository string, res *Result, signer *keyless.Signer, predicate any) (signed, attested bool, err error) {
+	if signer == nil {
+		return false, false, nil
+	}
+	sig, err := signer.Sign(ctx, res.ManifestDigest, "", nil)
+	if err != nil {
+		return false, false, fmt.Errorf("signing %s: %w", res.Reference, err)
+	}
+	if err := r.Attach(ctx, repository, res.Manifest, mediatype.SigstoreBundle, sig); err != nil {
+		return false, false, err
+	}
+	if predicate == nil {
+		return true, false, nil
+	}
+	att, err := signer.Sign(ctx, res.ManifestDigest, provenance.PredicateType, predicate)
+	if err != nil {
+		return true, false, fmt.Errorf("signing provenance for %s: %w", res.Reference, err)
+	}
+	if err := r.Attach(ctx, repository, res.Manifest, ProvenanceArtifactType, att); err != nil {
+		return true, false, err
+	}
+	return true, true, nil
 }
 
 func namespaceOf(repository string) string {
