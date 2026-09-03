@@ -12,7 +12,7 @@ This is the counterpart to [`grc-store-protocol`][protocol], and the split betwe
 | | `grc-store-protocol` | `grc-store-clientkit` (this repo) |
 |---|---|---|
 | Holds | the **wire contract** — types, constants, pure functions | the **client behaviour** that acts on it |
-| Dependencies | zero, enforced in CI | allowed (stdlib only today) |
+| Dependencies | zero, enforced in CI | allowed — oras-go, sigstore-go, go-gemara, the protocol module |
 | Network / disk | never | yes — that is what it is for |
 
 A thing belongs here when **more than one client tool must do it identically**, and getting it
@@ -27,6 +27,16 @@ does it, or if it is user-facing presentation — the CLIs own their own output.
 - **`auth`** — OIDC device-authorization grant (RFC 8628), the on-disk credential store, token
   resolution with refresh, and the GitHub Actions workload-OIDC fetch. Parameterized by an `App`
   (`{Name, TokenEnv, TokenFlag}`) so each tool keeps its own credential file and its own name in error messages.
+- **`hub`** — the hub's publish-side HTTP surface: discovery, the GitHub Actions trusted-publishing
+  bearer (`CIBearer`), registry-token mint with a push-grant check, the immutable-version preflight,
+  and the bundle + plugin sync routes.
+- **`bundle`** — pack one artifact into a Gemara OCI bundle, push it (or write an OCI layout for a
+  dry run), attach OCI 1.1 referrers, and `Publish`: the full sequence in the one order both tools
+  must share, fail-closed before any bytes move if the caller cannot push.
+- **`keyless`** — the Sigstore signing identity (explicit token, GitHub Actions, or browser) and a
+  DSSE in-toto signer emitting a Sigstore v0.3 bundle — the shared signed shape.
+- **`provenance`** — the SLSA v1 predicate a publish embeds and signs, including the evaluator
+  binding that ties an EvaluationLog to the plugin that produced it.
 - **`trustroot`** — the pinned public-good Sigstore trusted root, as bytes. Previously three
   byte-identical copies across grcli, privateer-sdk, and the hub backend; now one rotation obligation.
 
@@ -38,8 +48,9 @@ go vet ./...
 gofmt -l .       # must print nothing
 ```
 
-No Makefile. `go mod tidy` should stay a no-op — this module has no dependencies today, and adding
-one is a decision worth making deliberately rather than by accident.
+No Makefile. `go mod tidy` should stay a no-op. The protocol module is the zero-dependency one; this
+module carries oras-go, sigstore-go, go-gemara, and the protocol module, and adding anything further
+is a decision worth making deliberately rather than by accident.
 
 ## Gotchas
 
@@ -50,7 +61,11 @@ one is a decision worth making deliberately rather than by accident.
   three separate copies meant three chances to miss that.
 - **The bearer token this module resolves is not a signing identity.** Fulcio trusts public OIDC
   issuers, not the grc.store auth server. `auth.Resolve` gets you a token for the hub and registry;
-  keyless signing needs a separate token, from a separate issuer, with audience `sigstore`.
+  keyless signing needs a separate token, from a separate issuer, with audience `sigstore` —
+  that is `keyless.Identity`, and `bundle.Publish` takes the two separately on purpose.
+- **Env overrides are one `GRC_STORE_*` family** (`GRC_STORE_FULCIO_URL`, `GRC_STORE_REKOR_URL`,
+  `GRC_STORE_REGISTRY_TOKEN` / `_USERNAME` / `_PASSWORD`), read here so every tool honours them
+  identically. Per-tool token env vars (`GRCLI_TOKEN`, `PVTR_TOKEN`) stay per-tool.
 - **Credential files are per-tool by design.** grcli and pvtr authenticate against the same issuer,
   but one tool clobbering the other's tokens on logout is a genuinely confusing failure.
 - Pre-v1.0.0 (v0.x).
