@@ -6,7 +6,7 @@ require (
 	github.com/gemaraproj/go-gemara v0.9.2
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
-	github.com/revanite-io/grc-store-protocol v0.5.1
+	github.com/revanite-io/grc-store-protocol v0.5.2
 	github.com/sigstore/sigstore v1.10.9
 	github.com/sigstore/sigstore-go v1.3.0
 	oras.land/oras-go/v2 v2.6.2
