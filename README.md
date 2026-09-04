@@ -1,5 +1,8 @@
 # grc-store-clientkit
 
+> [!WARNING]
+> This library is under construction
+
 Apache-2.0 Go module holding the **client-side machinery shared by grc.store publishing tools** —
 today `grcli` and `privateer-sdk` (pvtr), which had independently grown near-identical copies of it.
 
