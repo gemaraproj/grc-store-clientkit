@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { echo '::error::gofmt:'; gofmt -l .; exit 1; }
+      - name: tidy must be a no-op
+        # Not the protocol module's zero-dependency check — this module carries
+        # oras-go, sigstore-go, go-gemara and the protocol module by design. What
+        # it does enforce is that a dependency never arrives by accident: adding
+        # one is a deliberate edit to go.mod, reviewed like any other.
+        run: |
+          go mod tidy
+          changed="$(git status --porcelain go.mod go.sum)"
+          if [ -n "$changed" ]; then
+            echo "::error::go mod tidy changed go.mod/go.sum — commit the result:"
+            echo "$changed"
+            exit 1
+          fi
+      # -race because this module hands out credentials and a process-wide
+      # discovery cache to concurrent callers.
+      - run: go test -race -count=1 ./...
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.12.2

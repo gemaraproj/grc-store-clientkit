@@ -43,10 +43,15 @@ does it, or if it is user-facing presentation — the CLIs own their own output.
 ## Dev loop
 
 ```
-go test ./...    # add -count=1 to skip the cache
+go test -race ./...   # add -count=1 to skip the cache
 go vet ./...
-gofmt -l .       # must print nothing
+gofmt -l .            # must print nothing
+golangci-lint run ./...
 ```
+
+CI runs those on every PR. A second, **advisory** workflow reports an API diff against the last tag
+and builds both consumer repos against the PR commit — it never blocks a merge, because on v0.x a
+breaking change can be the right call and a consumer's main can be red on its own.
 
 No Makefile. `go mod tidy` should stay a no-op. The protocol module is the zero-dependency one; this
 module carries oras-go, sigstore-go, go-gemara, and the protocol module, and adding anything further

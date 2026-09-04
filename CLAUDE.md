@@ -10,9 +10,13 @@ network, the disk, or a credential goes here. Something belongs here only when *
 tools must do it identically** and a subtle divergence would be invisible from either side.
 
 ## Dev loop
-- `go test ./...` · `go vet ./...` · `gofmt -l .` (must print nothing)
+- `go test -race ./...` · `go vet ./...` · `gofmt -l .` (must print nothing) · `golangci-lint run ./...`
 - No Makefile. `go mod tidy` should stay a no-op. The **protocol** module is the zero-dep one; this
   module carries oras-go, sigstore-go, go-gemara, and the protocol module (since v0.2.0).
+- CI: `ci.yml` gates the above. `compat.yml` is **advisory only** — a `gorelease` API diff against
+  the last tag, and a build of grcli + privateer-sdk against the PR commit. Neither blocks a merge:
+  on v0.x a breaking change is a legitimate call, and a consumer's main can be red for its own
+  reasons. Read the report, then write the CHANGELOG entry and pick the version yourself.
 
 ## Packages
 - `auth` — device-grant OIDC (RFC 8628), credential store, token resolution + refresh, GHA
@@ -30,6 +34,10 @@ tools must do it identically** and a subtle divergence would be invisible from e
 
 ## Gotchas
 - **Blast radius is three repos**: grcli, privateer-sdk, and the hub backend (`trustroot` only).
+  The downstream job in `compat.yml` is how you see a break before they do. **A break can arrive
+  without any API change**: a dependency this module raises (go-gemara, say) is raised under the
+  consumers too by minimal version selection, and their code meets the new API. That is exactly what
+  the go-gemara v0.9 bump did to grcli's `bundle.Files` call sites.
 - **`trustroot/trusted_root.json` is trust material.** Rotation is now one edit here — that is the
   entire reason the package exists. Do not let a consumer re-vendor its own copy.
 - **Do not add a signing-identity helper to `auth` that defaults its audience.** The hub bearer and

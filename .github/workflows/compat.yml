@@ -1,0 +1,97 @@
+# Compatibility signal for the three repos that import this module.
+#
+# Both jobs are ADVISORY: they report, they do not gate. On v0.x a breaking
+# change is a legitimate choice, and a consumer's main can go red for reasons
+# that have nothing to do with this module. A required check that must be
+# overridden every time is one people learn to ignore, which is worse than no
+# check. The gate is human: read the report, write the CHANGELOG entry, pick
+# the version.
+name: compat
+
+on:
+  pull_request:
+  schedule:
+    # Monday 06:00 UTC. Catches consumer drift while this module is idle — the
+    # break usually arrives from their side, not ours.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  api-diff:
+    name: api diff vs last tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # gorelease needs the tags to find a base, and refuses to run on a
+          # dirty tree — so this step must come before any go.mod edits.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gorelease
+        run: |
+          base="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [ -z "$base" ]; then
+            echo "no tag to compare against yet; nothing to report" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "## API diff vs \`$base\`" >> "$GITHUB_STEP_SUMMARY"
+          # gorelease exits non-zero for a suggested version bump and for
+          # unrelated diagnostics (e.g. a retracted transitive module), so its
+          # exit code is not a clean breaking/not-breaking signal. Read the
+          # report instead.
+          go run golang.org/x/exp/cmd/gorelease@latest -base "$base" > report.txt 2>&1 || true
+          {
+            echo '```'
+            cat report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if grep -q '## incompatible changes' report.txt; then
+            echo "::warning::incompatible API changes vs $base — consumers must be updated, and this needs a CHANGELOG entry"
+          fi
+
+  downstream:
+    name: downstream build (${{ matrix.consumer }})
+    runs-on: ubuntu-latest
+    # Informational: a consumer whose main has not yet adopted a change here
+    # will be red, and that must not block a merge.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        consumer:
+          - gemaraproj/grcli
+          - privateerproj/privateer-sdk
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: clientkit
+          persist-credentials: false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ matrix.consumer }}
+          path: consumer
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: consumer/go.mod
+          cache: false
+      - name: build the consumer against this commit
+        working-directory: consumer
+        # Build and vet only. Their suites are slow (real crypto, OCI) and their
+        # flakes are not this module's problem; what matters here is whether the
+        # code that imports us still compiles. `go mod tidy` runs first because
+        # a replace can pull new requirements into the consumer's module graph —
+        # which is exactly how a break arrives: minimal version selection raises
+        # a shared dependency (go-gemara, say) under the consumer's feet.
+        run: |
+          go mod edit -replace github.com/gemaraproj/grc-store-clientkit="$GITHUB_WORKSPACE/clientkit"
+          go mod tidy
+          go build ./...
+          go vet ./...

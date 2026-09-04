@@ -1,0 +1,12 @@
+version: "2"
+
+# golangci-lint v2. Byte-identical to grcli's config on purpose: a module both
+# client tools import should not be held to a different bar than the tools are.
+# The default linter set (standard) is kept; we only re-enable the
+# "std-error-handling" exclusion preset, which v1 applied by default but v2
+# makes opt-in. It excludes errcheck on fire-and-forget writes to
+# stdout/stderr (fmt.Fprint*, etc.).
+linters:
+  exclusions:
+    presets:
+      - std-error-handling
