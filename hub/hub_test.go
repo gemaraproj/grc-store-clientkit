@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/revanite-io/grc-store-protocol/discovery"
 	"github.com/revanite-io/grc-store-protocol/syncapi"
@@ -291,5 +292,158 @@ func TestSyncPlugin(t *testing.T) {
 	}
 	if gotPath != "/v1/plugins/acme/hello/sync" || gotBody.Repository != "acme/plugins/hello" || gotBody.Tag != "0.1.0" {
 		t.Errorf("path=%q body=%+v", gotPath, gotBody)
+	}
+}
+
+func TestNewTimeoutCoversPluginSync(t *testing.T) {
+	// Above the hub's 6-minute plugin sync write deadline.
+	if got := New("https://h", "").HTTP.Timeout; got != 7*time.Minute {
+		t.Errorf("timeout = %v, want 7m", got)
+	}
+}
+
+func TestSyncPluginRetriesSlotRefusals(t *testing.T) {
+	var waits []time.Duration
+	orig := sleep
+	sleep = func(_ context.Context, d time.Duration) error { waits = append(waits, d); return nil }
+	t.Cleanup(func() { sleep = orig })
+
+	serve := func(t *testing.T, refusals int, retryAfter string, status ...int) (*httptest.Server, *int32) {
+		t.Helper()
+		code := http.StatusServiceUnavailable
+		if len(status) > 0 {
+			code = status[0]
+		}
+		var hits int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Every attempt, retries included, must be the complete request.
+			var got syncapi.Request
+			b, _ := io.ReadAll(r.Body)
+			if err := json.Unmarshal(b, &got); err != nil || r.URL.Path != "/v1/plugins/acme/hello/sync" ||
+				got.Repository != "acme/plugins/hello" || got.Tag != "0.1.0" || r.Header.Get("Authorization") != "Bearer b" {
+				t.Errorf("attempt %d: path=%q body=%q auth=%q", atomic.LoadInt32(&hits)+1, r.URL.Path, b, r.Header.Get("Authorization"))
+			}
+			if int(atomic.AddInt32(&hits, 1)) <= refusals {
+				if retryAfter != "" {
+					w.Header().Set("Retry-After", retryAfter)
+				}
+				w.WriteHeader(code)
+				_, _ = w.Write([]byte(`{"error":"registry_error"}`))
+			}
+		}))
+		t.Cleanup(srv.Close)
+		return srv, &hits
+	}
+
+	t.Run("waits Retry-After and succeeds", func(t *testing.T) {
+		waits = nil
+		srv, hits := serve(t, 2, "60")
+		if err := New(srv.URL, "b").SyncPlugin(context.Background(), "acme", "hello", "0.1.0"); err != nil {
+			t.Fatal(err)
+		}
+		if *hits != 3 || len(waits) != 2 || waits[0] != time.Minute {
+			t.Errorf("hits=%d waits=%v", *hits, waits)
+		}
+	})
+	t.Run("gives up after MaxPluginSyncRetries", func(t *testing.T) {
+		waits = nil
+		srv, hits := serve(t, 1000, "60")
+		err := New(srv.URL, "b").SyncPlugin(context.Background(), "acme", "hello", "0.1.0")
+		if err == nil || !strings.Contains(err.Error(), "503") {
+			t.Fatalf("err = %v", err)
+		}
+		if int(*hits) != MaxPluginSyncRetries+1 || len(waits) != MaxPluginSyncRetries {
+			t.Errorf("hits=%d waits=%d", *hits, len(waits))
+		}
+	})
+	t.Run("a 503 without Retry-After is not retried", func(t *testing.T) {
+		waits = nil
+		srv, hits := serve(t, 1000, "")
+		if err := New(srv.URL, "b").SyncPlugin(context.Background(), "acme", "hello", "0.1.0"); err == nil {
+			t.Fatal("want error")
+		}
+		if *hits != 1 || len(waits) != 0 {
+			t.Errorf("hits=%d waits=%v", *hits, waits)
+		}
+	})
+	t.Run("another status with Retry-After is not retried", func(t *testing.T) {
+		waits = nil
+		srv, hits := serve(t, 1000, "60", http.StatusTooManyRequests)
+		err := New(srv.URL, "b").SyncPlugin(context.Background(), "acme", "hello", "0.1.0")
+		if err == nil || !strings.Contains(err.Error(), "429") || *hits != 1 || len(waits) != 0 {
+			t.Errorf("err=%v hits=%d waits=%v", err, *hits, waits)
+		}
+	})
+	t.Run("a cancelled wait stops the retries", func(t *testing.T) {
+		sleep = func(ctx context.Context, _ time.Duration) error { return context.Canceled }
+		t.Cleanup(func() { sleep = orig })
+		srv, hits := serve(t, 1000, "60")
+		err := New(srv.URL, "b").SyncPlugin(context.Background(), "acme", "hello", "0.1.0")
+		if !errors.Is(err, context.Canceled) || *hits != 1 {
+			t.Errorf("err=%v hits=%d", err, *hits)
+		}
+	})
+}
+
+func TestRetryAfter(t *testing.T) {
+	now := time.Date(2026, 11, 8, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		in   string
+		want time.Duration
+		ok   bool
+	}{
+		{"60", time.Minute, true},
+		{"0", 0, true},
+		{"86400", MaxRetryAfter, true},
+		{"10000000000", MaxRetryAfter, true}, // would overflow time.Duration unclamped
+		{now.Add(24 * time.Hour).Format(http.TimeFormat), MaxRetryAfter, true},
+		{"", 0, false},
+		{"-1", 0, false},
+		{"soon", 0, false},
+		{now.Add(30 * time.Second).Format(http.TimeFormat), 30 * time.Second, true},
+		{now.Add(-time.Hour).Format(http.TimeFormat), 0, true},
+	} {
+		h := http.Header{}
+		if tc.in != "" {
+			h.Set("Retry-After", tc.in)
+		}
+		got, ok := retryAfter(h, now)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("%q: got %v,%v want %v,%v", tc.in, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestStatusErrorCarriesStatusAndCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"plugin_version_immutable","detail":"x"}`))
+	}))
+	defer srv.Close()
+	err := New(srv.URL, "b").SyncPlugin(context.Background(), "acme", "hello", "0.1.0")
+	var se *StatusError
+	if !errors.As(err, &se) || se.Status != http.StatusConflict || se.Code != "plugin_version_immutable" {
+		t.Fatalf("err = %v (%+v)", err, se)
+	}
+	if !strings.Contains(err.Error(), "returned 409") || errors.Is(err, ErrUnauthorized) {
+		t.Errorf("err = %v", err)
+	}
+	if (&StatusError{Status: 401}).Unwrap() != ErrUnauthorized {
+		t.Error("401 must unwrap to ErrUnauthorized")
+	}
+	if (&StatusError{Status: 500, Body: []byte("oops")}).Code != "" {
+		t.Error("non-envelope body must leave Code empty")
+	}
+}
+
+func TestSleepHonoursCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if err := sleep(ctx, time.Hour); !errors.Is(err, context.Canceled) || time.Since(start) > time.Second {
+		t.Errorf("err=%v after %v", err, time.Since(start))
+	}
+	if err := sleep(context.Background(), time.Millisecond); err != nil {
+		t.Errorf("err = %v", err)
 	}
 }
