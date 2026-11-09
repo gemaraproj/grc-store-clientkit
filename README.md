@@ -62,6 +62,10 @@ is a decision worth making deliberately rather than by accident.
 
 ## Gotchas
 
+- **`bundle.Publish` needs a hub past the staging cutover.** It always pushes to
+  `staging/<ns>/<name>` (grc-store-protocol `staging.Repository`) and syncs the
+  served name, with no fallback, so it cannot publish to an older hub. The protocol `v0.28.1`
+  pin also raises the `go` directive to 1.26.10 for every consumer.
 - **Consumers are grcli, privateer-sdk, and (for `trustroot` only) the hub backend.** A breaking
   change ripples to all three; coordinate releases.
 - **`trustroot` is trust material, not configuration.** When the public-good Sigstore root rotates,

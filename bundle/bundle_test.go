@@ -169,7 +169,8 @@ func fakeHub(t *testing.T, grant []string) (*httptest.Server, *[]string) {
 		case "/.well-known/grc-store-configuration":
 			_, _ = fmt.Fprintf(w, `{"registry_url":"http://registry.test","hub_url":%q}`, srv.URL)
 		case "/v2/token":
-			payload, _ := json.Marshal(map[string]any{"access": []map[string]any{{"type": "repository", "name": "acme/my-log", "actions": grant}}})
+			*calls = append(*calls, "token-scope "+r.URL.Query().Get("scope"))
+			payload, _ := json.Marshal(map[string]any{"access": []map[string]any{{"type": "repository", "name": "staging/acme/my-log", "actions": grant}}})
 			tok := "e30." + base64.RawURLEncoding.EncodeToString(payload) + ".sig"
 			_, _ = fmt.Fprintf(w, `{"token":%q}`, tok)
 		case "/v1/bundles/sync":
@@ -194,8 +195,8 @@ func swapRepository(t *testing.T) (*memory.Store, *[]Registry) {
 	orig := openRepository
 	openRepository = func(r Registry, repository string) (oras.Target, error) {
 		*opened = append(*opened, r)
-		if repository != "acme/my-log" {
-			t.Errorf("repository = %q", repository)
+		if repository != "staging/acme/my-log" {
+			t.Errorf("repository = %q, want the staging form", repository)
 		}
 		return store, nil
 	}
@@ -211,12 +212,13 @@ func TestPublish_OrderAndSync(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.Signed || out.Attested || out.Sync.NewCount != 1 || out.Reference != "registry.test/acme/my-log:1.0.0-run1" {
+	if out.Signed || out.Attested || out.Sync.NewCount != 1 || out.Reference != "registry.test/staging/acme/my-log:1.0.0-run1" {
 		t.Errorf("published = %+v", out)
 	}
 	want := []string{
 		"GET /.well-known/grc-store-configuration",
 		"GET /v2/token",
+		"token-scope repository:staging/acme/my-log:pull,push",
 		"POST /v1/bundles/sync",
 		`sync-body {"repository":"acme/my-log","tag":"1.0.0-run1"}`,
 	}
@@ -236,8 +238,10 @@ func TestPublish_PullOnlyStopsBeforeAnyBytes(t *testing.T) {
 	_, opened := swapRepository(t)
 
 	_, err := Publish(context.Background(), testInput, Target{HubURL: srv.URL, Repository: "acme/my-log", Tag: "v", Bearer: "hub-bearer"}, nil)
-	if !errors.Is(err, ErrPushDenied) || !strings.Contains(err.Error(), `namespace "acme"`) {
-		t.Fatalf("err = %v", err)
+	for _, want := range []string{`namespace "acme"`, "staging/acme/my-log", "staging cutover"} {
+		if !errors.Is(err, ErrPushDenied) || !strings.Contains(err.Error(), want) {
+			t.Fatalf("err = %v, want ErrPushDenied naming %q", err, want)
+		}
 	}
 	if len(*opened) != 0 {
 		t.Error("registry must not be opened when push is denied")
@@ -262,6 +266,19 @@ func TestPublish_ExplicitRegistryTokenSkipsMint(t *testing.T) {
 	}
 	if (*opened)[0].Token != "manual" {
 		t.Errorf("token = %q", (*opened)[0].Token)
+	}
+}
+
+func TestPublish_RefusesANonServedRepositoryBeforeTheNetwork(t *testing.T) {
+	srv, calls := fakeHub(t, []string{"pull", "push"})
+	for _, repo := range []string{"my-log", "staging/acme/my-log", "acme//x", ""} {
+		_, err := Publish(context.Background(), testInput, Target{HubURL: srv.URL, Repository: repo, Tag: "v", Bearer: "hub-bearer"}, nil)
+		if err == nil || !strings.Contains(err.Error(), "not a served repository") {
+			t.Errorf("%q: err = %v", repo, err)
+		}
+	}
+	if len(*calls) != 0 {
+		t.Errorf("hub called for an invalid repository: %v", *calls)
 	}
 }
 

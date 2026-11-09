@@ -20,9 +20,11 @@ import (
 	"net/http"
 	neturl "net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/revanite-io/grc-store-protocol/apierror"
 	"github.com/revanite-io/grc-store-protocol/registrytoken"
 	"github.com/revanite-io/grc-store-protocol/syncapi"
 )
@@ -44,33 +46,46 @@ type Client struct {
 	HTTP    *http.Client
 }
 
-// New returns a Client with a 60s request timeout.
+// Timeout is the per-request timeout of a Client from New. It sits above
+// the hub's longest sync deadline, plugin sync's 6-minute write deadline,
+// and so also covers catalog and EvaluationLog sync (120 s). It is one
+// timeout for every route of the client: the hub bounds each sync itself,
+// so the longer wait costs nothing.
+const Timeout = 7 * time.Minute
+
+// New returns a Client with a request timeout of Timeout.
 func New(baseURL, bearer string) *Client {
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		Bearer:  bearer,
-		HTTP:    &http.Client{Timeout: 60 * time.Second},
+		HTTP:    &http.Client{Timeout: Timeout},
 	}
 }
 
 // do issues one request and returns status + capped body. A non-nil error is
 // a transport failure only; HTTP status is the caller's to interpret.
 func (c *Client) do(ctx context.Context, method, path string, body any, withBearer bool) (int, []byte, error) {
+	status, _, rb, err := c.doHeader(ctx, method, path, body, withBearer)
+	return status, rb, err
+}
+
+// doHeader is do plus the response headers.
+func (c *Client) doHeader(ctx context.Context, method, path string, body any, withBearer bool) (int, http.Header, []byte, error) {
 	if c.BaseURL == "" {
-		return 0, nil, errors.New("hub base URL is required")
+		return 0, nil, nil, errors.New("hub base URL is required")
 	}
 	var rd io.Reader
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, nil, err
 		}
 		rd = bytes.NewReader(data)
 	}
 	url := c.BaseURL + path
 	req, err := http.NewRequestWithContext(ctx, method, url, rd)
 	if err != nil {
-		return 0, nil, fmt.Errorf("building request for %s: %w", url, err)
+		return 0, nil, nil, fmt.Errorf("building request for %s: %w", url, err)
 	}
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
@@ -81,24 +96,50 @@ func (c *Client) do(ctx context.Context, method, path string, body any, withBear
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return 0, nil, fmt.Errorf("%s %s: %w", method, url, err)
+		return 0, nil, nil, fmt.Errorf("%s %s: %w", method, url, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	rb, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return resp.StatusCode, nil, fmt.Errorf("reading response from %s: %w", url, err)
+		return resp.StatusCode, resp.Header, nil, fmt.Errorf("reading response from %s: %w", url, err)
 	}
-	return resp.StatusCode, rb, nil
+	return resp.StatusCode, resp.Header, rb, nil
+}
+
+// StatusError is an unexpected hub status: URL, status, the apierror code
+// from the body ("" when the body is not an apierror.Envelope) and a capped
+// body. Callers branch on it with errors.As; a 401 also matches
+// ErrUnauthorized through errors.Is.
+type StatusError struct {
+	What   string // the route, as the message names it ("plugin sync")
+	URL    string
+	Status int
+	Code   string // apierror code, e.g. "plugin_version_immutable"
+	Body   []byte
+}
+
+func (e *StatusError) Error() string {
+	msg := fmt.Sprintf("hub %s %s returned %d: %s", e.What, e.URL, e.Status, bytes.TrimSpace(e.Body))
+	if e.Status == http.StatusUnauthorized {
+		return ErrUnauthorized.Error() + ": " + msg // the text a 401 carried before StatusError
+	}
+	return msg
+}
+
+// Unwrap lets errors.Is(err, ErrUnauthorized) hold for a 401.
+func (e *StatusError) Unwrap() error {
+	if e.Status == http.StatusUnauthorized {
+		return ErrUnauthorized
+	}
+	return nil
 }
 
 // statusErr is the one diagnostic shape for an unexpected hub status:
 // URL + status + body snippet, so a 5xx on any route reads the same.
 func (c *Client) statusErr(what, path string, status int, body []byte) error {
-	err := fmt.Errorf("hub %s %s returned %d: %s", what, c.BaseURL+path, status, bytes.TrimSpace(body))
-	if status == http.StatusUnauthorized {
-		return fmt.Errorf("%w: %w", ErrUnauthorized, err)
-	}
-	return err
+	var env apierror.Envelope
+	_ = json.Unmarshal(body, &env) // a non-envelope body leaves Code empty
+	return &StatusError{What: what, URL: c.BaseURL + path, Status: status, Code: env.Error, Body: body}
 }
 
 // VersionStatus reports whether a (namespace, id, version) coordinate is
@@ -236,25 +277,89 @@ func (c *Client) SyncBundle(ctx context.Context, repository, tag string) (*synca
 	return out, nil
 }
 
-// PluginRepository is the registry repository a plugin's image index lives
-// in: <namespace>/plugins/<id>.
+// PluginRepository is the served registry repository a plugin's image index
+// lives in: <namespace>/plugins/<id>. Publishers push to its staging form,
+// staging.Repository(PluginRepository(ns, id)); only
+// the hub writes the served one.
 func PluginRepository(namespace, id string) string {
 	return namespace + "/plugins/" + id
 }
 
+// MaxPluginSyncRetries bounds SyncPlugin's retries of a 503 that carries
+// Retry-After: 12 waits of the hub's 60 s is two full plugin copy deadlines,
+// enough for the third of three plugins in one namespace released together.
+const MaxPluginSyncRetries = 12
+
+// sleep is swapped by tests so a Retry-After wait does not take real time.
+var sleep = func(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 // SyncPlugin calls POST /v1/plugins/{ns}/{id}/sync for a plugin image index
-// already pushed to PluginRepository(ns, id):tag.
+// already pushed to the staging form of PluginRepository(ns, id) at tag. The
+// request names the served repository; the hub derives the staging one,
+// checks the upload there and promotes it.
+//
+// The hub refuses a promotion it has no slot for with 503 and Retry-After.
+// SyncPlugin waits the given time and retries, at most MaxPluginSyncRetries
+// times, then returns the last error. A 503 without Retry-After, or any
+// other status, is returned at once.
 func (c *Client) SyncPlugin(ctx context.Context, namespace, id, tag string) error {
 	if c.Bearer == "" {
 		return ErrNoBearer
 	}
 	path := fmt.Sprintf("/v1/plugins/%s/%s/sync", neturl.PathEscape(namespace), neturl.PathEscape(id))
-	status, body, err := c.do(ctx, http.MethodPost, path, syncapi.Request{Repository: PluginRepository(namespace, id), Tag: tag}, true)
-	if err != nil {
-		return err
+	req := syncapi.Request{Repository: PluginRepository(namespace, id), Tag: tag}
+	for attempt := 0; ; attempt++ {
+		status, hdr, body, err := c.doHeader(ctx, http.MethodPost, path, req, true)
+		if err != nil {
+			return err
+		}
+		if status/100 == 2 {
+			return nil
+		}
+		wait, ok := retryAfter(hdr, time.Now())
+		if status != http.StatusServiceUnavailable || !ok || attempt == MaxPluginSyncRetries {
+			return c.statusErr("plugin sync", path, status, body)
+		}
+		if err := sleep(ctx, wait); err != nil {
+			return fmt.Errorf("waiting to retry plugin sync after %d: %w", status, err)
+		}
 	}
-	if status/100 != 2 {
-		return c.statusErr("plugin sync", path, status, body)
+}
+
+// MaxRetryAfter caps one SyncPlugin wait. The hub sends 60 s; a larger value
+// (a proxy, a misconfigured hub) is clamped so the retries stay near the
+// 12 minutes MaxPluginSyncRetries budgets instead of hanging a CI job.
+const MaxRetryAfter = 2 * time.Minute
+
+// retryAfter reads a Retry-After header, in delay-seconds or HTTP-date form
+// (RFC 9110 §10.2.3), clamped to [0, MaxRetryAfter]. ok is false when it is
+// absent or unparsable.
+func retryAfter(h http.Header, now time.Time) (time.Duration, bool) {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0, false
 	}
-	return nil
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
+		if secs < 0 {
+			return 0, false
+		}
+		// Compared in seconds first so a huge value cannot overflow Duration.
+		if secs >= int64(MaxRetryAfter/time.Second) {
+			return MaxRetryAfter, true
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	if at, err := http.ParseTime(v); err == nil {
+		return min(max(at.Sub(now), 0), MaxRetryAfter), true
+	}
+	return 0, false
 }

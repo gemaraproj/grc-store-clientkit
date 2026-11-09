@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/revanite-io/grc-store-protocol/mediatype"
+	"github.com/revanite-io/grc-store-protocol/staging"
 	"github.com/revanite-io/grc-store-protocol/syncapi"
 
 	"github.com/gemaraproj/grc-store-clientkit/hub"
@@ -16,8 +17,9 @@ import (
 )
 
 // ErrPushDenied is returned before any bytes move when the hub minted a
-// pull-only registry token: the bearer's principal does not own the
-// repository's namespace.
+// pull-only registry token for the staging repository: the bearer's
+// principal does not own the repository's namespace, or the hub predates the
+// staging cutover and grants no push on staging repositories.
 var ErrPushDenied = errors.New("registry token does not grant push")
 
 // Target is where Publish sends the bundle. Bearer is the hub bearer the
@@ -27,7 +29,7 @@ var ErrPushDenied = errors.New("registry token does not grant push")
 // mint (a manual credential override); otherwise Publish mints one.
 type Target struct {
 	HubURL        string
-	Repository    string // <namespace>/<id>
+	Repository    string // served repository, <namespace>/<id>; the push goes to its staging form
 	Tag           string
 	Bearer        string
 	RegistryToken string
@@ -41,22 +43,34 @@ type Published struct {
 	Attested bool // signed provenance referrer attached
 }
 
-// Publish runs the shared sequence, fail-closed at each preflight:
+// Publish runs the shared sequence, fail-closed at each preflight. Every
+// registry write goes to the staging repository staging.Repository(
+// t.Repository); only the hub writes the served one, when sync promotes the
+// checked bundle. There is no fallback to the served
+// repository, so Publish cannot publish to a hub before the cutover.
 //
 //  1. discover the hub (registry host, plain-HTTP);
-//  2. mint a pull+push registry token and stop on ErrPushDenied — before
-//     packing, so a non-owner never leaves orphaned bytes;
-//  3. pack + push + tag the bundle;
+//  2. mint a pull+push registry token for the staging repository and stop
+//     on ErrPushDenied — before packing, so a non-owner never leaves
+//     orphaned bytes;
+//  3. pack + push + tag the bundle in the staging repository;
 //  4. signer != nil: sign the manifest digest (DSSE in-toto) and attach it as
 //     a mediatype.SigstoreBundle referrer;
 //  5. signer != nil && in.Provenance != nil: sign the SLSA predicate over the
 //     same subject and attach it as a ProvenanceArtifactType referrer;
-//  6. POST /v1/bundles/sync.
+//  6. POST /v1/bundles/sync naming the served repository.
+//
+// Result.Reference names the staging push; after a successful sync the
+// bundle is served at t.Repository:t.Tag.
 //
 // A nil signer publishes unsigned; the hub rejects that at sync for
 // verified types, which is the intended backstop. The signer's identity is
 // the Fulcio one (keyless.Identity), never t.Bearer.
 func Publish(ctx context.Context, in Input, t Target, signer *keyless.Signer) (*Published, error) {
+	stagingRepo, ok := staging.Repository(t.Repository)
+	if !ok {
+		return nil, fmt.Errorf("repository %q is not a served repository of the form <namespace>/<name>", t.Repository)
+	}
 	disco, err := hub.Discover(ctx, t.HubURL)
 	if err != nil {
 		return nil, err
@@ -69,22 +83,22 @@ func Publish(ctx context.Context, in Input, t Target, signer *keyless.Signer) (*
 
 	reg := Registry{Host: host, PlainHTTP: plainHTTP, Token: t.RegistryToken}
 	if reg.Token == "" {
-		tok, err := client.RegistryToken(ctx, t.Repository, []string{"pull", "push"})
+		tok, err := client.RegistryToken(ctx, stagingRepo, []string{"pull", "push"})
 		if err != nil {
 			return nil, fmt.Errorf("minting registry token: %w", err)
 		}
 		if !tok.GrantsPush() {
-			return nil, fmt.Errorf("%w to %s: the bearer's principal must own namespace %q", ErrPushDenied, t.Repository, namespaceOf(t.Repository))
+			return nil, fmt.Errorf("%w to staging repository %s: the bearer's principal must own namespace %q, and the hub must support staging pushes (a hub from before the staging cutover does not)", ErrPushDenied, stagingRepo, namespaceOf(t.Repository))
 		}
 		reg.Token = tok.Token
 	}
 
-	res, err := reg.Push(ctx, t.Repository, t.Tag, in)
+	res, err := reg.Push(ctx, stagingRepo, t.Tag, in)
 	if err != nil {
 		return nil, err
 	}
 	out := &Published{Result: *res}
-	out.Signed, out.Attested, err = reg.SignAndAttach(ctx, t.Repository, res, signer, in.Provenance)
+	out.Signed, out.Attested, err = reg.SignAndAttach(ctx, stagingRepo, res, signer, in.Provenance)
 	if err != nil {
 		return nil, err
 	}
